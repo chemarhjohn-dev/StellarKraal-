@@ -196,4 +196,110 @@ describe('POST /api/v1/loans - Idempotency', () => {
       expect(response.body).toHaveProperty('error');
     });
   });
+
+  describe('Atomic Transaction Rollback', () => {
+    const collateralId = 'col-atomic-001';
+    const loanData = {
+      amount: 5000,
+      collateralId,
+      terms: { duration: 30, interestRate: 0.05 }
+    };
+
+    afterEach(async () => {
+      jest.restoreAllMocks();
+      await db('loans').where('collateral_id', collateralId).delete();
+      await db('collaterals').where('id', collateralId).update({ locked: false });
+    });
+
+    it('should roll back loan creation when collateral lock fails mid-transaction', async () => {
+      const key = 'test-idempotency-key-atomic-001';
+
+      // Simulate a mid-transaction failure after the loan row is inserted
+      const originalTransaction = db.transaction.bind(db);
+      jest.spyOn(db, 'transaction').mockImplementation(async (cb: any) => {
+        return originalTransaction(async (trx: any) => {
+          const originalInsert = trx.insert.bind(trx);
+          let loanInserted = false;
+          trx.insert = (data: any) => {
+            const builder = originalInsert(data);
+            if (!loanInserted) {
+              loanInserted = true;
+              // Fail on the subsequent collateral lock write
+              const originalUpdate = trx.update.bind(trx);
+              trx.update = () => {
+                throw new Error('simulated collateral lock failure');
+              };
+              void originalUpdate;
+            }
+            return builder;
+          };
+          return cb(trx);
+        });
+      });
+
+      const response = await request(app)
+        .post('/api/v1/loans')
+        .set('Authorization', `Bearer ${authToken}`)
+        .set('Idempotency-Key', key)
+        .send(loanData);
+
+      expect(response.status).toBe(500);
+      expect(response.body).toHaveProperty('correlationId');
+
+      // No partial state should be persisted
+      const persistedLoans = await db('loans').where('collateral_id', collateralId);
+      expect(persistedLoans).toHaveLength(0);
+
+      const collateral = await db('collaterals').where('id', collateralId).first();
+      expect(collateral?.locked).toBe(false);
+    });
+
+    it('should roll back liquidation when event logging fails mid-transaction', async () => {
+      const key = 'test-idempotency-key-atomic-002';
+
+      // Create a loan to liquidate
+      const created = await request(app)
+        .post('/api/v1/loans')
+        .set('Authorization', `Bearer ${authToken}`)
+        .set('Idempotency-Key', key)
+        .send(loanData);
+
+      expect(created.status).toBe(201);
+      const loanId = created.body.data.id;
+
+      // Simulate a failure while logging the liquidation event
+      const originalTransaction = db.transaction.bind(db);
+      jest.spyOn(db, 'transaction').mockImplementation(async (cb: any) => {
+        return originalTransaction(async (trx: any) => {
+          const originalInsert = trx.insert.bind(trx);
+          trx.insert = (data: any) => {
+            if (data && data.event_type === 'loan_liquidated') {
+              throw new Error('simulated event log failure');
+            }
+            return originalInsert(data);
+          };
+          return cb(trx);
+        });
+      });
+
+      const response = await request(app)
+        .post(`/api/v1/loans/${loanId}/liquidate`)
+        .set('Authorization', `Bearer ${authToken}`)
+        .send({ reason: 'test liquidation' });
+
+      expect(response.status).toBe(500);
+      expect(response.body).toHaveProperty('correlationId');
+
+      // Loan status must remain unchanged and collateral must stay locked
+      const loan = await db('loans').where('id', loanId).first();
+      expect(loan?.status).not.toBe('liquidated');
+
+      const collateral = await db('collaterals').where('id', collateralId).first();
+      expect(collateral?.locked).toBe(true);
+
+      const events = await db('loan_events')
+        .where({ loan_id: loanId, event_type: 'loan_liquidated' });
+      expect(events).toHaveLength(0);
+    });
+  });
 });
